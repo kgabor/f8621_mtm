@@ -1,0 +1,4 @@
+date,asset,type,quantity,unit price,total price
+2019-01-01,A1,buy,5,2,10
+2020-01-01,A1,buy,10,3,30
+2021-01-01,A1,sell,1,5,5
