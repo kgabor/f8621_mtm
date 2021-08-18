@@ -1,5 +1,5 @@
 from astropy.time import Time
-from astropy.table import Table, MaskedColumn
+from astropy.table import Table, MaskedColumn, Column
 import numpy as np
 
 
@@ -18,26 +18,28 @@ class AssetHistory:
         pass
 
 
-def getValue(t, valueT, k1, k2):
+def getValue(t, valueT, k_t, k_val):
     """
     Parameters
     ----------
-    t : value of key where we are interested in
+    t  : value of key where we are interested in
+    k_t : key in valueT for ``t``
+    k_val : value in valueT
     """
-    if not np.all(valueT[k1][1:] - valueT[k1][:-1] >= 0):
+    if not np.all(valueT[k_t][1:] - valueT[k_t][:-1] >= 0):
         raise ValueError("valueT is not monotonic increasing in dates")
-    i = np.searchsorted(valueT[k1], t)
+    i = np.searchsorted(valueT[k_t], t)
     if i < len(valueT):
-        if valueT[k1][i] == t:
-            return valueT[k2][i]
+        if valueT[k_t][i] == t:
+            return valueT[k_val][i]
         if i == 0:
             print("WARNING: Value data starts later than interested dates")
-            return valueT[k2][0]
-        vlast = valueT[k2][i-1]
-        return vlast + (valueT[k2][i] - vlast) * (t - valueT[k1][i-1]) / (valueT[k1][i] - valueT[k1][i-1])
+            return valueT[k_val][0]
+        vlast = valueT[k_val][i-1]
+        return vlast + (valueT[k_val][i]-vlast) * (t-valueT[k_t][i-1]) / (valueT[k_t][i]-valueT[k_t][i-1])
     else:
         print("WARNING: Value data ends earlier than interested dates")
-        return valueT[k2][-1]
+        return valueT[k_val][-1]
 
 
 def prepareRawTransactions(traw):
@@ -49,7 +51,7 @@ def prepareRawTransactions(traw):
     return traw
 
 
-def packetizeTransactions(traw):
+def packetizeTransactions(traw, assetPrefix):
     """Creates a 1-to-1 buy-sell transaction pairing, FIFO order
 
     Currently supports one asset type only.
@@ -57,16 +59,19 @@ def packetizeTransactions(traw):
     Parameters
     ----------
     traw : `astropy.table.Table`
-    'tranType' : 'sell', 'buy'
-    'unitPrice' : float
-    'quantity' : number of units bought/sold
+     'tranType' : 'sell', 'buy'
+     'unitPrice' : float
+     'quantity' : number of units bought/sold
+    assetPrefix : string
+      Prefix string for packet ids
     """
     packets = traw[traw['type'] == 'buy']
     packets.sort(keys=['dateS', ])
     packets.remove_columns(['type', 'total price'])
     packets.rename_columns(['unit price'], ['priceS'])
     packets.add_column(MaskedColumn(np.zeros(len(packets)), name='priceE', mask=True))
-    packets.add_column(np.arange(1, len(packets)+1), name='pId')
+    packets.add_column(Column([f'{assetPrefix}{x:03d}' for x in range(1, len(packets)+1)],
+                              dtype='S20'), name='pId')
 
     selltable = traw[traw['type'] == 'sell']
     npId = len(packets)+1
@@ -99,37 +104,139 @@ def packetizeTransactions(traw):
     return packets
 
 
-def calculateYearMMGain(packets, gainsT=None, asset, tyear, valueT):
+# def calculateYearMMGain(packets, asset, tyear, valueT, gainsT=None):
+#     """
+#     Must be used in incrementing tax years.
+#     Goes through the packets and calculates either its tax year MM gain,
+
+
+#     gainsT : gains table, if None, first transition year
+#     asset : asset id
+#     tyear : tax year, must be incremental
+#     totGain : total gain since buy if it was sold this tax year, otherwise 0
+#     yGain : yearly gain MM or loss if it was not sold this tax year
+#     urevInc : Unreversed inclusion at the end of the tax year, that
+#               includes present year.
+#     """
+
+#     flt = packets['asset'] == asset
+#     D = packets[flt]
+
+#     if gainsT is None:
+#         pass  # Initialize empty table
+#     yGain = 0
+#     flt = (gainsT['asset'] == asset) & (gainsT['year'] == tyear - 1)
+#     flt = np.flatnonzero(flt)
+#     if len(flt) == 0:
+#         print(f"First year {tyear} for {asset}.")
+#         urevInc = 0  # Init from table
+#     elif len(flt) > 1:
+#         raise ValueError(f"Multiple entries for {tyear-1} {asset}")
+#     else:
+#         urevInc = gainsT['urevInc'][flt]
+
+#     totGain = 0
+#     yearS = Time(f"{tyear:d}-1-1")
+#     yearE = Time(f"{tyear+1:d}-1-1")
+
+#     for pkt in D:
+#         if pkt['dateS'] >= yearE or (not pkt['dateE'].mask and pkt['dateE'] < yearS):
+#             # We don't hold this packet during this tax year
+#             continue
+
+#         # This packet's contribution in this year
+#         dyGain = 0
+#         dUrevInc = 0
+#         dTotGain = 0
+
+#         if pkt['dateE'].mask:
+#             if pkt['dateS'] < yearS:
+#                 overlapS = yearS
+#             else:
+#                 overlapS = pkt['dateS']
+#             delta = getValue(yearE, valueT, 'date', 'price') \
+#                 - getValue(overlapS, valueT, 'date', 'price')
+#             delta *= pkt['quantity']
+#             if delta > 0:
+#                 dyGain = delta
+#                 dUrevInc = delta
+#             elif delta < 0 and urevInc > 0:
+#                 d2 = min(abs(delta), urevInc)
+#                 dUrevInc = -d2
+#                 dyGain = -d2
+#         else:
+#             # This packet was sold during this tax year
+#             delta = getValue(pkt['dateE'], valueT, 'date', 'price') \
+#                 - getValue(pkt['dateS'], valueT, 'date', 'price')
+#             delta *= pkt['quantity']
+#             if delta < 0 and urevInc > 0:
+#                 d2 = min(abs(delta), urevInc)
+#                 dUrevInc = -d2
+#                 delta -= d2
+#             dTotGain = delta
+#         totGain += dTotGain
+#         urevInc += dUrevInc
+#         yGain += dyGain
+#         print(f"{tyear:4d} {pkt['pId']} : {dTotGain:6.0f} {dyGain:6.0f} {dUrevInc:6.0f} | "
+#               f"{totGain:6.0f} {yGain:6.0f} {urevInc:6.0f}")
+#     gainsT.add_row([asset, tyear, totGain, yGain, urevInc])
+
+#     return gainsT
+
+
+def calculateYearTaxes(packets, assetId, tyear, valueT,
+                       packetGainsT=None, totalGainsT=None, firstMMTaxYear=False):
     """
     Must be used in incrementing tax years.
     Goes through the packets and calculates either its tax year MM gain,
 
+    valueT: the table of asset values as a function of time
 
-    gainsT : gains table
+    packetGainsT : gains table, if None, first transition year
     asset : asset id
     tyear : tax year, must be incremental
     totGain : total gain since buy if it was sold this tax year, otherwise 0
     yGain : yearly gain MM or loss if it was not sold this tax year
     urevInc : Unreversed inclusion at the end of the tax year, that
               includes present year.
+
+
+    urevInc is per asset and changes with each packet.
+    ``oBasis``, ``MMBasis`` are per packet (consider buying more over time,
+    then some packet losses can be unrev but not all)
     """
 
-    flt = packets['asset'] == asset
+    flt = packets['asset'] == assetId
     D = packets[flt]
 
+    if firstMMTaxYear is None:
+        totalGainsT = Table(
+            names=('tyear', 'assetId', 'urevIncS', 'urevIncE'),
+            dtype=(int, 'S20', float, float, float,
+                   float, float, float, float, float))
+        packetGainsT = Table(
+            names=('tyear', 'packetId', 'oBasisS', 'MMBasisS',
+                   'regInc', 'LtcGain', 'oBasisE', 'MMBasisE'),
+            dtype=(int, 'S20', float, float,
+                   float, float, float, float))
+        # oBasisS : ordinary basis for this packet at the beginning of tax year
+        # oBasisE : ordinary basis for this packet at the end of tax year
+        urevInc = 0
+    else:
+        prevY = tyear-1
+        flt = (totalGainsT['asset'] == assetId) & (totalGainsT['year'] == prevY)
+        urevInc = totalGainsT['urevIncE'][flt][0]
 
-    if gainsT is None:
-        pass  # Initialize empty table
     yGain = 0
-    flt = (gainsT['asset'] == asset) & (gainsT['year'] == tyear - 1)
+    flt = (packetGainsT['asset'] == assetId) & (packetGainsT['year'] == tyear - 1)
     flt = np.flatnonzero(flt)
     if len(flt) == 0:
-        print(f"First year {tyear} for {asset}.")
+        print(f"First year {tyear} for {assetId}.")
         urevInc = 0  # Init from table
     elif len(flt) > 1:
         raise ValueError(f"Multiple entries for {tyear-1} {asset}")
     else:
-        urevInc = gainsT['urevInc'][flt]
+        urevInc = packetGainsT['urevInc'][flt]
 
     totGain = 0
     yearS = Time(f"{tyear:d}-1-1")
@@ -175,6 +282,6 @@ def calculateYearMMGain(packets, gainsT=None, asset, tyear, valueT):
         yGain += dyGain
         print(f"{tyear:4d} {pkt['pId']} : {dTotGain:6.0f} {dyGain:6.0f} {dUrevInc:6.0f} | "
               f"{totGain:6.0f} {yGain:6.0f} {urevInc:6.0f}")
-    gainsT.add_row([asset, tyear, totGain, yGain, urevInc])
+    packetGainsT.add_row([asset, tyear, totGain, yGain, urevInc])
 
-    return gainsT
+    return packetGainsT
