@@ -20,11 +20,13 @@ class AssetHistory:
 
 def getValue(t, valueT, k_t, k_val):
     """
+
+    Interpolates
     Parameters
     ----------
     t  : value of key where we are interested in
-    k_t : key in valueT for ``t``
-    k_val : value in valueT
+    k_t : key for t in valueT for ``t``
+    k_val : key for value in valueT
     """
     if not np.all(valueT[k_t][1:] - valueT[k_t][:-1] >= 0):
         raise ValueError("valueT is not monotonic increasing in dates")
@@ -71,7 +73,7 @@ def packetizeTransactions(traw, assetPrefix):
     packets.rename_columns(['unit price'], ['priceS'])
     packets.add_column(MaskedColumn(np.zeros(len(packets)), name='priceE', mask=True))
     packets.add_column(Column([f'{assetPrefix}{x:03d}' for x in range(1, len(packets)+1)],
-                              dtype='S20'), name='pId')
+                              dtype='S20'), name='packetId')
 
     selltable = traw[traw['type'] == 'sell']
     npId = len(packets)+1
@@ -97,7 +99,7 @@ def packetizeTransactions(traw, assetPrefix):
                 packets['quantity'][irec] = r
                 packets['dateE'].mask[irec] = True
                 packets['priceE'].mask[irec] = True
-                packets['pId'][irec] = npId
+                packets['packetId'][irec] = npId
                 npId += 1
                 saleUnits = 0.
             ii += 1
@@ -209,7 +211,7 @@ def calculateYearTaxes(packets, assetId, tyear, valueT,
     flt = packets['asset'] == assetId
     D = packets[flt]
 
-    if firstMMTaxYear is None:
+    if firstMMTaxYear:
         totalGainsT = Table(
             names=('tyear', 'assetId', 'urevIncS', 'urevIncE'),
             dtype=(int, 'S20', float, float, float,
@@ -227,18 +229,9 @@ def calculateYearTaxes(packets, assetId, tyear, valueT,
         flt = (totalGainsT['asset'] == assetId) & (totalGainsT['year'] == prevY)
         urevInc = totalGainsT['urevIncE'][flt][0]
 
-    yGain = 0
-    flt = (packetGainsT['asset'] == assetId) & (packetGainsT['year'] == tyear - 1)
-    flt = np.flatnonzero(flt)
-    if len(flt) == 0:
-        print(f"First year {tyear} for {assetId}.")
-        urevInc = 0  # Init from table
-    elif len(flt) > 1:
-        raise ValueError(f"Multiple entries for {tyear-1} {asset}")
-    else:
-        urevInc = packetGainsT['urevInc'][flt]
+    yRegInc = 0
+    yLtcGain = 0
 
-    totGain = 0
     yearS = Time(f"{tyear:d}-1-1")
     yearE = Time(f"{tyear+1:d}-1-1")
 
@@ -248,40 +241,77 @@ def calculateYearTaxes(packets, assetId, tyear, valueT,
             continue
 
         # This packet's contribution in this year
-        dyGain = 0
+        dyRegInc = 0
         dUrevInc = 0
-        dTotGain = 0
+        dyLtcGain = 0
+
+        if pkt['dateS'] < yearS:
+            # This packet was bought in an earlier year
+            overlapS = yearS
+            if firstMMTaxYear:
+                oBasisS = pkt['priceS']
+                MMBasisS = oBasisS
+                # Step up basis for first MM year
+                ySPrice = getValue(yearS, valueT, 'date', 'price')
+                if ySPrice > MMBasisS:
+                    # transition rule, step up MM basis
+                    MMBasisS = ySPrice
+            else:
+                # This packet's bases from previous tax year
+                flt = ((packetGainsT['packetId'] == pkt['packetId'])
+                       & (packetGainsT['tyear'] == prevY))
+                oBasisS = packetGainsT['oBasisE'][flt][0]
+                MMBasisS = packetGainsT['MMBasisE'][flt][0]
+        else:
+            # This packet was purchased during the MM tax year
+            overlapS = pkt['dateS']
+            oBasisS = pkt['priceS']
+            MMBasisS = oBasisS
 
         if pkt['dateE'].mask:
-            if pkt['dateS'] < yearS:
-                overlapS = yearS
-            else:
-                overlapS = pkt['dateS']
-            delta = getValue(yearE, valueT, 'date', 'price') \
-                - getValue(overlapS, valueT, 'date', 'price')
-            delta *= pkt['quantity']
-            if delta > 0:
-                dyGain = delta
-                dUrevInc = delta
-            elif delta < 0 and urevInc > 0:
-                d2 = min(abs(delta), urevInc)
-                dUrevInc = -d2
-                dyGain = -d2
+            # This packet was not sold during this tax year
+            overlapE = yearE
         else:
-            # This packet was sold during this tax year
-            delta = getValue(pkt['dateE'], valueT, 'date', 'price') \
-                - getValue(pkt['dateS'], valueT, 'date', 'price')
-            delta *= pkt['quantity']
-            if delta < 0 and urevInc > 0:
-                d2 = min(abs(delta), urevInc)
-                dUrevInc = -d2
-                delta -= d2
-            dTotGain = delta
+            # This packet was sold, MM and ltcGain calculation
+            overlapE = pkt['dateE']
+        # Determine the MM regular income for the tax year
+        priceE = getValue(overlapE, valueT, 'date', 'price')
+        dPrice = priceE - MMBasisS
+        oBasisE = oBasisS
+        MMBasisE = MMBasisS
+        gain = dPrice * pkt['quantity']  # gain or loss
+        if dPrice > 0:
+            MMBasisE = MMBasisS + dPrice
+            oBasisE = oBasisS + dPrice
+            urevInc += gain
+            # dUrevInc = gain
+            dyRegInc = gain
+        elif dPrice < 0 and urevInc > 0:
+            lossLim = min(abs(gain), urevInc)  # positive
+            dyRegInc = -lossLim
+            urevInc -= lossLim
+            dPrice2 = lossLim / pkt['quantity']
+            MMBasisE = MMBasisS - dPrice2
+            oBasisE = oBasisS - dPrice2
+        # Determine the LtcGain
+        if not pkt['dateE'].mask:
+            dPrice = priceE - oBasisE
+            ltcGain = dPrice * pkt['quantity']  # gain or loss
+            if dPrice > 0:
+                oBasisE += dPrice
+                dyLtcGain = ltcGain
+            elif dPrice < 0 and urevInc > 0:
+                # Can ltcLoss happen in this setup?
+                print("WARNING ltcLoss should not happen")
+                lossLim = min(abs(ltcGain), urevInc)  # positive
+                dyLtcGain = -lossLim
+                urevInc -= lossLim
+
         totGain += dTotGain
         urevInc += dUrevInc
-        yGain += dyGain
+        yRegInc += dyGain
         print(f"{tyear:4d} {pkt['pId']} : {dTotGain:6.0f} {dyGain:6.0f} {dUrevInc:6.0f} | "
-              f"{totGain:6.0f} {yGain:6.0f} {urevInc:6.0f}")
-    packetGainsT.add_row([asset, tyear, totGain, yGain, urevInc])
+              f"{totGain:6.0f} {yRegInc:6.0f} {urevInc:6.0f}")
+    packetGainsT.add_row([asset, tyear, totGain, yRegInc, urevInc])
 
     return packetGainsT
