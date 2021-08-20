@@ -1,6 +1,7 @@
 from astropy.time import Time
 from astropy.table import Table, MaskedColumn, Column
 import numpy as np
+import astropy.table
 
 
 class AssetHistory:
@@ -38,10 +39,20 @@ def getValue(t, valueT, k_t, k_val):
             print("WARNING: Value data starts later than interested dates")
             return valueT[k_val][0]
         vlast = valueT[k_val][i-1]
-        return vlast + (valueT[k_val][i]-vlast) * (t-valueT[k_t][i-1]) / (valueT[k_t][i]-valueT[k_t][i-1])
+        r = (t-valueT[k_t][i-1]) / (valueT[k_t][i]-valueT[k_t][i-1])
+        return vlast + (valueT[k_val][i]-vlast) * r.value
     else:
         print("WARNING: Value data ends earlier than interested dates")
         return valueT[k_val][-1]
+
+
+def getPriceConverted(t, priceT, currencyT=None):
+    v = getValue(t, priceT, 'date', 'price')
+    if currencyT is not None:
+        xchg = getValue(t, currencyT, 'date', 'rate')
+    else:
+        xchg = 1.
+    return v*xchg
 
 
 def prepareRawTransactions(traw):
@@ -51,6 +62,15 @@ def prepareRawTransactions(traw):
     traw.add_column(MaskedColumn(traw['dateS'], name='dateE', mask=True))
     # traw.add_column(np.arange(1, len(traw)+1), name='pId')
     return traw
+
+
+def extendPriceTable(priceT, preprawT, assetId):
+    """Adds new entries from the packetized transactions to the price table"""
+    p2 = preprawT.copy()
+    p2.rename_column('dateS', 'date')
+    p2.rename_column('unit price', 'price')
+    R = astropy.table.vstack([priceT, p2])
+    return astropy.table.unique(R, keys=['date', 'price'], keep='first')
 
 
 def packetizeTransactions(traw, assetPrefix):
@@ -66,25 +86,32 @@ def packetizeTransactions(traw, assetPrefix):
      'quantity' : number of units bought/sold
     assetPrefix : string
       Prefix string for packet ids
+
+    traw will be sorted in-place by date
     """
+    traw.sort(keys=['dateS', ])
     packets = traw[traw['type'] == 'buy']
-    packets.sort(keys=['dateS', ])
     packets.remove_columns(['type', 'total price'])
     packets.rename_columns(['unit price'], ['priceS'])
     packets.add_column(MaskedColumn(np.zeros(len(packets)), name='priceE', mask=True))
     packets.add_column(Column([f'{assetPrefix}{x:03d}' for x in range(1, len(packets)+1)],
                               dtype='S20'), name='packetId')
-
     selltable = traw[traw['type'] == 'sell']
     npId = len(packets)+1
+    dfmt = "%Y-%m-%d"
     for sale in selltable:
         i_consider = np.searchsorted(packets['dateS'], sale['dateS'], side='right')
         i_unclosed = np.flatnonzero(packets['dateE'].mask[:i_consider])
+        L = [f'{x["dateS"].strftime(dfmt)}:{x["quantity"]}@{x["priceS"]}' for x in packets[i_unclosed]]
+        print("======")
+        print(f"Sale {sale['dateS'].strftime(dfmt)}:{sale['quantity']}@{sale['unit price']} -> \nBuys ")
+        print("\n".join(L))
         saleUnits = sale['quantity']
-        ii = 0
+        ii = 0  # Index in i_unclosed
         while saleUnits > 0.:
+            print(f"Using buy {ii}")
             if len(i_unclosed) <= ii:
-                raise ValueError("No match found for sale.")
+                raise ValueError("Data error - No more buy transaction to match sale.")
             irec = i_unclosed[ii]
             packets['dateE'].mask[irec] = False
             packets['priceE'].mask[irec] = False
@@ -92,22 +119,26 @@ def packetizeTransactions(traw, assetPrefix):
             packets['priceE'][irec] = sale['unit price']
             if saleUnits > packets['quantity'][irec]:
                 saleUnits -= packets['quantity'][irec]  # Still to match sale
+                print(f"Still to sale {saleUnits}")
             else:
                 r = packets['quantity'][irec] - saleUnits
-                packets.insert_row(irec+1, packets[irec])
+                if r > 0.:
+                    print(f"Remaining from buy : {r}")
+                    packets.insert_row(irec+1, packets[irec])
                 packets['quantity'][irec] = saleUnits
-                irec += 1
-                packets['quantity'][irec] = r
-                packets['dateE'].mask[irec] = True
-                packets['priceE'].mask[irec] = True
-                packets['packetId'][irec] = npId
-                npId += 1
+                if r > 0.:
+                    irec += 1
+                    packets['quantity'][irec] = r
+                    packets['dateE'].mask[irec] = True
+                    packets['priceE'].mask[irec] = True
+                    packets['packetId'][irec] = f'{assetPrefix}{npId:03d}'
+                    npId += 1
                 saleUnits = 0.
             ii += 1
     return packets
 
 
-def calculateOneYearOneAssetTaxes(packets, assetId, tyear, priceT,
+def calculateOneYearOneAssetTaxes(packetsT, assetId, tyear, priceT,
                                   packetGainsT=None, totalGainsT=None,
                                   firstMMTaxYear=False):
     """
@@ -116,7 +147,7 @@ def calculateOneYearOneAssetTaxes(packets, assetId, tyear, priceT,
 
     Parameters
     ==========
-    packets: `astropy.table.Table`
+    packetsT: `astropy.table.Table`
         Packetized transactions
     assetId : `string`
         asset id
@@ -139,9 +170,9 @@ def calculateOneYearOneAssetTaxes(packets, assetId, tyear, priceT,
     yearS = Time(f"{tyear:d}-1-1")
     yearE = Time(f"{tyear+1:d}-1-1")
 
-    flt = packets['asset'] == assetId
-    D = packets[flt]
-    # In this tax year, only packets that are bought before the end of this year
+    flt = packetsT['asset'] == assetId
+    D = packetsT[flt]
+    # In this tax year, only packetsT that are bought before the end of this year
     # and either not sold at all or sold during this year matter
     flt = (D['dateS'] < yearE) & (D['dateE'].mask | (D['dateE'] >= yearS))
     D = D[flt]
@@ -165,7 +196,7 @@ def calculateOneYearOneAssetTaxes(packets, assetId, tyear, priceT,
         urevIncS = 0
     else:
         prevY = tyear-1
-        flt = (totalGainsT['asset'] == assetId) & (totalGainsT['year'] == prevY)
+        flt = (totalGainsT['assetId'] == assetId) & (totalGainsT['tyear'] == prevY)
         urevIncS = totalGainsT['urevIncE'][flt][0]
 
     urevInc = urevIncS
@@ -206,11 +237,12 @@ def calculateOneYearOneAssetTaxes(packets, assetId, tyear, priceT,
         if pkt['dateE'].mask or pkt['dateE'] >= yearE:
             # This packet was not sold during this tax year
             overlapE = yearE
+            priceE = getValue(overlapE, priceT, 'date', 'price')
         else:
             # This packet was sold, MM and ltcGain calculation
             overlapE = pkt['dateE']
+            priceE = pkt['priceE']  # Here we know the exact price
         # Determine the MM regular income for the tax year
-        priceE = getValue(overlapE, priceT, 'date', 'price')
         dPrice = priceE - MMBasisS
         oBasisE = oBasisS
         MMBasisE = MMBasisS
@@ -252,8 +284,6 @@ def calculateOneYearOneAssetTaxes(packets, assetId, tyear, priceT,
         yRegInc += dyRegInc
         yLtcGain += dyLtcGain
 
-        # print(f"{tyear:4d} {pkt['pId']} : {dTotGain:6.0f} {dyGain:6.0f} {dUrevInc:6.0f} | "
-        #       f"{totGain:6.0f} {yRegInc:6.0f} {urevInc:6.0f}")
     totalGainsT.add_row(
         dict(tyear=tyear, assetId=assetId, urevIncS=urevIncS, urevIncE=urevInc,
              regInc=yRegInc, ltcGain=yLtcGain))
