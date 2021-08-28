@@ -2,7 +2,7 @@ from astropy.time import Time
 from astropy.table import Table, MaskedColumn, Column
 import numpy as np
 import astropy.table
-
+import astropy.units as units
 
 class MMCalculator:
     """The calculator"""
@@ -49,7 +49,7 @@ class MMCalculator:
             raise ValueError(f"Value data ends earlier than interested point {t}, keys: {k_t} {k_val}")
             return valueT[k_val][-1]
 
-    def getPriceConverted(self, t):
+    def getPrice(self, t):
         v = self.getValue(t, self.priceT, 'date', 'price')
         if self.currName is not None:
             xchg = self.getValue(t, self.xchgT, 'date', f'per{self.currName}')
@@ -91,6 +91,7 @@ class MMCalculator:
 
         traw will be sorted in-place by date
         """
+        raise NotImplementedError("Here prices should be converted to usd.")
         traw = traw[traw['assetId'] == self.assetId]
         traw.sort(keys=['dateS', ])
         packets = traw[traw['type'] == 'buy']
@@ -184,16 +185,19 @@ class MMCalculator:
 
         if firstMMTaxYear:
             totalGainsT = Table(
-                names=('tyear', 'assetId',
-                       'regInc', 'ltcGain', 'L10a_valueE', 'L10b_MMbasis', 'L10c_gainloss',
-                       'L11_urevinc', 'L12_limitLoss'),
-                dtype=(int, 'S20', float, float,
-                       float, float, float, float, float, float, float))
+                names=('tyear', 'assetId', 'holdValueE', 'holdRegInc', 'soldValueE'
+                       'soldRegInc', 'ltcGain'),
+                dtype=(int, 'S20', float, float, float,
+                       float, float))
+            # holdRegInc, soldRegInc, ltcGain: signed, with allowed loss
             packetGainsT = Table(
                 names=('tyear', 'assetId', 'packetId', 'oBasisS', 'MMBasisS', 'urevIncS'
-                       'valueE', 'regInc', 'oBasisL', 'ltcGain', 'oBasisE', 'MMBasisE', 'urevIncE', 'soldThisYear'),
+                       'valueE', 'holdRegInc', 'soldRegInc', 'oBasisL', 'ltcGain',
+                       'oBasisE', 'MMBasisE', 'urevIncE', 'soldThisYear'),
                 dtype=(int, 'S20', 'S20', float, float, float,
-                       float, float, float, float, float, float, float, bool))
+                       float, float, float, float, float,
+                       float, float, float, bool))
+            self.packetGainsT = packetGainsT
             # oBasisS : ordinary basis cost for this packet at the beginning of tax year
             # oBasisE : ordinary basis cost for this packet at the end of tax year if not sold
             # valueE : FMV at the end of tax year or when sold
@@ -202,31 +206,39 @@ class MMCalculator:
             # (oBasisS + tax year MM inclusion/allowed deduction)
             # ltcGain: signed: long term capital gain or loss if sold
             # urevIncE : unreversed inclusion if not sold
-            urevIncS = 0
+            prevY = None
         else:
             prevY = tyear-1
-            flt = (totalGainsT['assetId'] == assetId) & (totalGainsT['tyear'] == prevY)
-            urevIncS = totalGainsT['urevIncE'][flt][0]
+            # flt = (totalGainsT['assetId'] == assetId) & (totalGainsT['tyear'] == prevY)
+            # urevIncS = totalGainsT['urevIncE'][flt][0]
+            packetGainsT = self.packetGainsT
 
-        yRegInc = 0.
-        yLtcGain = 0.
-        yearPacketsT = Table(
-            names=('tyear', 'assetId', 'packetId', 'oBasisS', 'MMBasisS',
-                   'valueE', 'regInc', 'ltcGain', 'oBasisE', 'MMBasisE', 'soldThisYear'),
-            dtype=(int, 'S20', 'S20', float, float,
-                   float, float, float, float, float, bool))
+        # yRegInc = 0.
+        # yLtcGain = 0.
+        # yearPacketsT = Table(
+        #     names=('tyear', 'assetId', 'packetId', 'oBasisS', 'MMBasisS',
+        #            'valueE', 'regInc', 'ltcGain', 'oBasisE', 'MMBasisE', 'soldThisYear'),
+        #     dtype=(int, 'S20', 'S20', float, float,
+        #            float, float, float, float, float, bool))
         for pkt in D:
             # This packet's contribution in this year
-            dyRegInc = 0
-            dyLtcGain = 0
+            dsoldRegInc = 0
+            dLtcGain = 0
+            dholdRegInc = 0
+            dsoldOtherLoss = 0
 
             if pkt['dateS'] < yearS:
                 # This packet was bought in an earlier year
                 if firstMMTaxYear:
+                    urevInc = 0.
                     oBasisS = pkt['priceS']*pkt['quantity']
+                    if pkt['reinvest']:
+                        # If packet was a result of reinvest
+                        # we will pay ltc on this amount
+                        oBasisS = 0.
                     MMBasisS = oBasisS
                     # Step up basis for first MM year
-                    yBasis = getValue(yearS, priceT, 'date', 'price')*pkt['quantity']
+                    yBasis = self.getPrice(yearS)*pkt['quantity']
                     if yBasis > MMBasisS:
                         # transition rule, step up MM basis
                         MMBasisS = yBasis
@@ -236,85 +248,129 @@ class MMCalculator:
                            & (packetGainsT['tyear'] == prevY))
                     oBasisS = packetGainsT['oBasisE'][flt][0]
                     MMBasisS = packetGainsT['MMBasisE'][flt][0]
+                    urevInc = packetGainsT['urevIncE'][flt][0]
             else:
                 # This packet was purchased during the MM tax year
                 oBasisS = pkt['priceS']*pkt['quantity']
+                urevInc = 0.
+                if pkt['reinvest']:
+                    # If packet was a result of reinvest
+                    # we pay ord. income tax on this amount
+                    oBasisS = 0.
                 MMBasisS = oBasisS
-
+            urevIncS = urevInc
             if pkt['dateE'].mask or pkt['dateE'] >= yearE:
                 # This packet was not sold during this tax year
                 soldThisYear = False
                 overlapE = yearE
-                valueE = getValue(overlapE, priceT, 'date', 'price')*pkt['quantity']
+                valueE = self.getPrice(overlapE)*pkt['quantity']
             else:
-                # This packet was sold, here we get the MM
-                # below the ltcGain
+                # This packet was sold during this tax year
                 soldThisYear = True
+                if pkt['dateE'] - pkt['dateS'] >= 1. * units.year:
+                    longTerm = True
+                else:
+                    longTerm = False
+
                 overlapE = pkt['dateE']
                 valueE = pkt['priceE']*pkt['quantity']  # Here we know the exact price
-            # Determine the MM regular income/loss for the tax year
+            # Determine the MM regular income for the tax year
             gain = valueE - MMBasisS
             oBasisE = oBasisS
             MMBasisE = MMBasisS
-            dyRegInc = 0.
-            MMBasisE = MMBasisS + gain
-            oBasisE = oBasisS + gain
-            dyRegInc = gain
-            # Determine the LtcGain of pre-MM years
-            # if this packet is sold during the tax year
-            # If packet was purchased this year, it'll be zero anyway
-            dyLtcGain = 0.
-            if soldThisYear:
-                dyLtcGain = valueE - oBasisE
-                oBasisE = valueE
-            yearPacketsT.add_row(
-                dict(tyear=tyear, assetId=assetId, packetId=pkt['packetId'],
-                     oBasisS=oBasisS, MMBasisS=MMBasisS,
-                     valueE=valueE, regInc=dyRegInc, ltcGain=dyLtcGain,
-                     oBasisE=oBasisE, MMBasisE=MMBasisE,
-                     soldThisYear=soldThisYear))
-
-        # Now see how much loss we can afford with the urevinc
-        yearPacketsT.sort(keys=['regInc', ], reverse=True)  # First the gains then the losses
-        urevs = urevIncS + np.cumsum(yearPacketsT['regInc'])
-        i_negs = np.flatnonzero(urevs < 0.)
-        if len(i_negs) > 0:
-            for ii in range(len(i_negs)):
-                fi = i_negs[ii]
-                if ii == 0:
-                    # The first item that was not fully covered by urevinc
-                    lossAdjust = abs(urevs[fi])
+            if gain > 0:
+                MMBasisE = MMBasisS + gain
+                oBasisE = oBasisS + gain
+                urevInc += gain
+                if soldThisYear:
+                    dsoldRegInc = gain
+                    oBasisL = oBasisE
+                    dLtcGain = valueE - oBasisL
+                    # This packet has no further bases
+                    oBasisE = 0
+                    MMBasisE = 0
                 else:
-                    # All others must be totally reversed
-                    lossAdjust = abs(yearPacketsT['regInc'][fi])
-                yearPacketsT['regInc'][fi] += lossAdjust
-                yearPacketsT['MMBasisE'][fi] += lossAdjust
-                yearPacketsT['oBasisE'][fi] += lossAdjust
-                if yearPacketsT['soldThisYear'][fi]:
-                    dyLtcGain -= lossAdjust
-                    yearPacketsT['oBasisE'][fi] -= lossAdjust
-        # Calculcate the line values
-        flt = yearPacketsT['soldThisYear']
-        soldT = yearPacketsT[flt]
-        keptT = yearPacketsT[np.logical_not(flt)]
-        urevInc = urevIncS
-        L10a_valueE = np.sum(keptT['valueE'])
-        L10b_MMBasis = np.sum(keptT['MMBasisS'])
-        L10c_gainloss = L10a_valueE - L10b_MMBasis
-        L13c_gainloss = np.sum(soldT['valueE']) - np.sum(soldT['MMBasisS'])
-        if L10c_gainloss < 0.:
-            if L13c_gainloss > 0.:
-                # It is possible that the sold gain is also used here in reversal
-                urevInc += L13c_gainloss
-            L11_urevInc = urevInc
+                    dholdRegInc = gain
+                    # No ltc calculation this year
+                    oBasisL = 0
 
-            urevInc += L10c_gainloss
+            else:  # Loss on MM tax year
+                lossLim = min(abs(gain), urevInc)  # positive
+                MMBasisE = MMBasisS - lossLim
+                oBasisE = oBasisS - lossLim
+                if soldThisYear:
+                    dsoldRegInc = -lossLim
+                    oBasisL = oBasisE
+                    if abs(gain) > urevInc:
+                        print("WARNING: We don't know how to handle LTCgain in this case")
+                        dsoldOtherLoss = abs(gain) - lossLim
+                        # This does not make sense
+                        # oBasisL -= dsoldOtherLoss
+                    if longTerm:
+                        dLtcGain = valueE - oBasisL  # We can still have a positive ltc
+                        if dLtcGain < 0.:
+                            dsoldOtherLoss -= abs(dLtcGain)  # This part of the loss is LTC, the rest is 14c
+                            # We already included this loss in 14c as well
+                            # dLtcGain = 0.
+                    oBasisE = 0
+                    MMBasisE = 0
+                    urevInc = 0
+                else:
+                    dholdRegInc = -lossLim
+                    oBasisL = 0
+                    urevInc -= lossLim
+            urevIncE = urevInc
+            packetGainsT.add_row(
+                dict(tyear=tyear, assetId=assetId, packetId=pkt['packetId'],
+                     oBasisS=oBasisS, MMBasisS=MMBasisS, urevIncS=urevIncS,
+                     valueE=valueE, holdRegInc=dholdRegInc, soldRegInc=dsoldRegInc,
+                     oBasisL=oBasisL, ltcGain=dLtcGain, oBasisE=oBasisE, MMBasisE=MMBasisE,
+                     urevIncE=urevIncE, soldThisYear=soldThisYear))
 
-        if L13c_gainloss < 0. :
-            if L10c_gainloss > 0.:
-                # It is possible that the kept gain is also used here in reversal
-                urevInc += L10c_gainloss
-            L14a_urevInc = urevInc
+        #     yearPacketsT.add_row(
+        #         dict(tyear=tyear, assetId=assetId, packetId=pkt['packetId'],
+        #              oBasisS=oBasisS, MMBasisS=MMBasisS,
+        #              valueE=valueE, regInc=dyRegInc, ltcGain=dyLtcGain,
+        #              oBasisE=oBasisE, MMBasisE=MMBasisE,
+        #              soldThisYear=soldThisYear))
+
+        # # Now see how much loss we can afford with the urevinc
+        # yearPacketsT.sort(keys=['regInc', ], reverse=True)  # First the gains then the losses
+        # urevs = urevIncS + np.cumsum(yearPacketsT['regInc'])
+        # i_negs = np.flatnonzero(urevs < 0.)
+        # if len(i_negs) > 0:
+        #     for ii in range(len(i_negs)):
+        #         fi = i_negs[ii]
+        #         if ii == 0:
+        #             # The first item that was not fully covered by urevinc
+        #             lossAdjust = abs(urevs[fi])
+        #         else:
+        #             # All others must be totally reversed
+        #             lossAdjust = abs(yearPacketsT['regInc'][fi])
+        #         yearPacketsT['regInc'][fi] += lossAdjust
+        #         yearPacketsT['MMBasisE'][fi] += lossAdjust
+        #         yearPacketsT['oBasisE'][fi] += lossAdjust
+        #         if yearPacketsT['soldThisYear'][fi]:
+        #             dyLtcGain -= lossAdjust
+        #             yearPacketsT['oBasisE'][fi] -= lossAdjust
+        # # Calculcate the line values
+        # flt = yearPacketsT['soldThisYear']
+        # soldT = yearPacketsT[flt]
+        # keptT = yearPacketsT[np.logical_not(flt)]
+        # urevInc = urevIncS
+        # L10a_valueE = np.sum(keptT['valueE'])
+        # L10b_MMBasis = np.sum(keptT['MMBasisS'])
+        # L10c_gainloss = L10a_valueE - L10b_MMBasis
+        # L13c_gainloss = np.sum(soldT['valueE']) - np.sum(soldT['MMBasisS'])
+        # if L10c_gainloss < 0.:
+        #     if L13c_gainloss > 0.:
+        #         # It is possible that the sold gain is also used here in reversal
+        #         urevInc += L13c_gainloss
+        #     L11_urevInc = urevInc
+
+        #     urevInc += L10c_gainloss
+
+
 
         packetGainsT = astropy.table.vstack([packetGainsT, yearPacketsT], join_type='exact')
         # ======
