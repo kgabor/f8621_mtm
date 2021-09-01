@@ -62,7 +62,7 @@ class MMCalculator:
     #         return r
 
     @staticmethod
-    def getValue(t, valueT, k_t, k_val):
+    def getValue(t, valueT, k_t, k_val, tmax=None):
         """
 
         Interpolates
@@ -82,39 +82,42 @@ class MMCalculator:
                 print("WARNING: Value data starts later than interested dates")
                 return valueT[k_val][0]
             vlast = valueT[k_val][i-1]
-            r = (t-valueT[k_t][i-1]) / (valueT[k_t][i]-valueT[k_t][i-1])
+            d = (valueT[k_t][i]-valueT[k_t][i-1])
+            r = (t-valueT[k_t][i-1]) / d
+            if tmax is not None and abs(r.value-round(r.value)) * d > tmax:
+                print(f"WARNING: interpolation exceeds {tmax} distance")
             return vlast + (valueT[k_val][i]-vlast) * r.value
         else:
             print("WARNING: Value data ends earlier than interested dates")
             return valueT[k_val][-1]
 
     @staticmethod
-    def getMultiValue(tstamps, valueT, k_t, k_val):
-        """Get the price in USD
+    def getMultiValue(tstamps, valueT, k_t, k_val, tmax=None):
+        """Get multiple values from a price or exchange rate table
         """
         v = np.zeros(len(tstamps), dtype=float)
         for i, t in enumerate(tstamps):
-            v[i] = MMCalculator.getValue(t, valueT, k_t, k_val)
+            v[i] = MMCalculator.getValue(t, valueT, k_t, k_val, tmax=tmax)
         return v
 
-    def getMultiPrice(self, tstamps):
-        """Get the price in USD
-        """
-        v = self.getMultiValue(tstamps, self.priceT, 'date', 'price')
-        if self.currName is not None:
-            xchg = self.getMultiValue(tstamps, self.xchgT, 'date', f'per{self.currName}')
-        else:
-            xchg = 1.
-        return v*xchg
+    # def getMultiPrice(self, tstamps):
+    #     """Get the price in USD
+    #     """
+    #     v = self.getMultiValue(tstamps, self.priceT, 'date', 'price')
+    #     if self.currName is not None:
+    #         xchg = self.getMultiValue(tstamps, self.xchgT, 'date', f'per{self.currName}')
+    #     else:
+    #         xchg = 1.
+    #     return v*xchg
 
-    def getMultiRates(self, tstamps):
-        rates = self.getMultiValue(tstamps, self.xchgT, 'date', f'per{self.currName}')
+    def getMultiRates(self, tstamps, tmax=62*units.day):
+        rates = self.getMultiValue(tstamps, self.xchgT, 'date', f'per{self.currName}', tmax=tmax)
         return rates
 
     def getPrice(self, t):
         """Get the price in USD
         """
-        v = self.getValue(t, self.priceT, 'date', 'price')
+        v = self.getValue(t, self.priceT, 'date', 'price', tmax=30*units.day)
         if self.currName is not None:
             xchg = self.getValue(t, self.xchgT, 'date', f'per{self.currName}')
         else:
@@ -390,6 +393,8 @@ class MMCalculator:
                         dsoldOtherLoss = abs(gain) - lossLim  # This is a long term cap. loss
                         oBasisL -= dsoldOtherLoss
                     dLtcGain = valueE - oBasisL  # We can still have a positive ltc
+                    # dsoldOtherLoss and dLtcGain can net each other in schedule D
+                    # but overall loss that can be accumulated is limited
                     oBasisE = 0
                     MMBasisE = 0
                     urevInc = 0
@@ -461,3 +466,47 @@ class MMCalculator:
         #          regInc=yRegInc, ltcGain=yLtcGain))
 
         return packetGainsT
+
+    def printFormStatement(self, tyear):
+        J = astropy.table.join(self.packetGainsT[self.packetGainsT['tyear'] == tyear], self.packetsT,
+                               keys=['packetId', 'assetId'])
+        # Sold items
+        J2 = J[J['soldThisYear']]
+        J2['dateS'] = Time(J2['dateS'], out_subfmt='date')
+        J2['dateE'] = Time(J2['dateE'], out_subfmt='date')
+        H = J2['dateS', 'dateE', 'quantity', 'valueE', 'MMBasisS', 'soldRegGain', 'urevIncS',
+               'soldRegLoss', 'soldOtherLoss', 'oBasisL', 'ltcGain']
+        H.sort(keys=['dateE'])
+        print("Sales during the tax year\n")
+        astropy.io.ascii.write(
+            H, format='fixed_width_two_line',
+            formats={'MMBasisS': "%.2f", 'valueE': "%.2f",
+                     'oBasisL': "%.2f", 'ltcGain': "%.2f", 'urevIncS': "%.2f", 'soldRegLoss': "%.2f",
+                     'soldRegGain': "%.2f", 'soldOtherLoss': "%.2f"})
+
+        snames = ('quantity', 'valueE', 'MMBasisS', 'soldRegGain', 'soldRegLoss', 'soldOtherLoss', 'ltcGain')
+        print("\nTotals:")
+        print("=======")
+        for x in snames:
+            s = np.sum(J2[x])
+            print(f"{x:15s}: {s:8.2f}")
+
+        print("\n\n")
+        # ==========
+
+        J2 = J[np.logical_not(J['soldThisYear'])]
+        J2['dateS'] = Time(J2['dateS'], out_subfmt='date')
+        H = J2['dateS', 'quantity', 'valueE', 'MMBasisS', 'holdRegGain', 'urevIncS', 'holdRegLoss']
+        print("Holdings at the end of the tax year\n")
+        astropy.io.ascii.write(
+            H, format='fixed_width_two_line',
+            formats={'quantity': '%.2f', 'MMBasisS': "%.2f", 'valueE': "%.2f",
+                     'urevIncS': "%.2f", 'holdRegLoss': "%.2f",
+                     'holdRegGain': "%.2f"})
+
+        snames = ('quantity', 'valueE', 'MMBasisS', 'urevIncS', 'holdRegGain', 'holdRegLoss','holdRegInc')
+        print("\nTotals:")
+        print("=======")
+        for x in snames:
+            s = np.sum(J2[x])
+            print(f"{x:15s}: {s:8.2f}")
