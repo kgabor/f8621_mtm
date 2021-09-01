@@ -4,6 +4,7 @@ import numpy as np
 import astropy.table
 import astropy.units as units
 
+
 class MMCalculator:
     """The calculator"""
 
@@ -17,6 +18,7 @@ class MMCalculator:
         self.currName = currName  # Prefix for currency
         self.assetId = assetId
         self.priceT = priceT[priceT['assetId'] == assetId]
+        self.priceT.sort(keys=['date', ])
         self.packetsT = None
         self.packetGainsT = None
         # self.totalGainsT = None
@@ -79,7 +81,7 @@ class MMCalculator:
             if valueT[k_t][i] == t:
                 return valueT[k_val][i]
             if i == 0:
-                print("WARNING: Value data starts later than interested dates")
+                print(f"WARNING: Value data starts later. Interested {t} first data: {valueT[k_t][0]}")
                 return valueT[k_val][0]
             vlast = valueT[k_val][i-1]
             d = (valueT[k_t][i]-valueT[k_t][i-1])
@@ -88,7 +90,7 @@ class MMCalculator:
                 print(f"WARNING: interpolation exceeds {tmax} distance")
             return vlast + (valueT[k_val][i]-vlast) * r.value
         else:
-            print("WARNING: Value data ends earlier than interested dates")
+            print(f"WARNING: Value data ends earlier. Interested {t} last data: {valueT[k_t][-1]}")
             return valueT[k_val][-1]
 
     @staticmethod
@@ -142,7 +144,7 @@ class MMCalculator:
         R = astropy.table.vstack([self.priceT, p2])
         self.priceT = astropy.table.unique(R, keys=['date', 'price'], keep='first')
 
-    def packetizeTransactions(self, traw, assetPrefix):
+    def packetizeTransactions(self, traw, assetPrefix, debug=False):
         """Creates a 1-to-1 buy-sell transaction pairing, FIFO order
 
         Currently supports one asset type only.
@@ -172,14 +174,18 @@ class MMCalculator:
         for sale in selltable:
             i_consider = np.searchsorted(packets['dateS'], sale['dateS'], side='right')
             i_unclosed = np.flatnonzero(packets['dateE'].mask[:i_consider])
-            L = [f'{x["dateS"].strftime(dfmt)}:{x["quantity"]}@{x["priceS"]}' for x in packets[i_unclosed]]
-            print("======")
-            print(f"Sale {sale['dateS'].strftime(dfmt)}:{sale['quantity']}@{sale['unit price']} -> \nBuys ")
-            print("\n".join(L))
+            if debug:
+                L = [f'{x["dateS"].strftime(dfmt)}:{x["quantity"]}@{x["priceS"]}'
+                     for x in packets[i_unclosed]]
+                print("======")
+                print(f"Sale {sale['dateS'].strftime(dfmt)}:{sale['quantity']}@{sale['unit price']}"
+                      " -> \nBuys ")
+                print("\n".join(L))
             saleUnits = sale['quantity']
             ii = 0  # Index in i_unclosed
             while saleUnits > 0.:
-                print(f"Using buy {ii}")
+                if debug:
+                    print(f"Using buy {ii}")
                 if len(i_unclosed) <= ii:
                     raise ValueError("Data error - No more buy transaction to match sale.")
                 irec = i_unclosed[ii]
@@ -189,11 +195,13 @@ class MMCalculator:
                 packets['priceE'][irec] = sale['unit price']
                 if saleUnits > packets['quantity'][irec]:
                     saleUnits -= packets['quantity'][irec]  # Still to match sale
-                    print(f"Still to sale {saleUnits}")
+                    if debug:
+                        print(f"Still to sale {saleUnits}")
                 else:
                     r = packets['quantity'][irec] - saleUnits
                     if r > 0.:
-                        print(f"Remaining from buy : {r}")
+                        if debug:
+                            print(f"Remaining from buy : {r}")
                         packets.insert_row(irec+1, packets[irec])
                     packets['quantity'][irec] = saleUnits
                     if r > 0.:
@@ -325,7 +333,6 @@ class MMCalculator:
                     MMBasisS = oBasisS
                     # Step up basis for first MM year
                     yBasis = self.getPrice(yearS)*pkt['quantity']
-                    print(yBasis, MMBasisS)
                     if yBasis > MMBasisS:
                         # transition rule, step up MM basis
                         MMBasisS = yBasis
@@ -468,45 +475,51 @@ class MMCalculator:
         return packetGainsT
 
     def printFormStatement(self, tyear):
+        print(f"Statement - Form 8621 - {self.assetId}")
+
         J = astropy.table.join(self.packetGainsT[self.packetGainsT['tyear'] == tyear], self.packetsT,
                                keys=['packetId', 'assetId'])
         # Sold items
         J2 = J[J['soldThisYear']]
-        J2['dateS'] = Time(J2['dateS'], out_subfmt='date')
-        J2['dateE'] = Time(J2['dateE'], out_subfmt='date')
-        H = J2['dateS', 'dateE', 'quantity', 'valueE', 'MMBasisS', 'soldRegGain', 'urevIncS',
-               'soldRegLoss', 'soldOtherLoss', 'oBasisL', 'ltcGain']
-        H.sort(keys=['dateE'])
-        print("Sales during the tax year\n")
-        astropy.io.ascii.write(
-            H, format='fixed_width_two_line',
-            formats={'MMBasisS': "%.2f", 'valueE': "%.2f",
-                     'oBasisL': "%.2f", 'ltcGain': "%.2f", 'urevIncS': "%.2f", 'soldRegLoss': "%.2f",
-                     'soldRegGain': "%.2f", 'soldOtherLoss': "%.2f"})
+        if len(J2) > 0:
+            J2['dateS'] = Time(J2['dateS'], out_subfmt='date')
+            J2['dateE'] = Time(J2['dateE'], out_subfmt='date')
+            H = J2['dateS', 'dateE', 'quantity', 'valueE', 'MMBasisS', 'soldRegGain', 'urevIncS',
+                   'soldRegLoss', 'soldOtherLoss', 'oBasisL', 'ltcGain']
+            H.sort(keys=['dateE'])
+            print("Sales during the tax year\n")
+            astropy.io.ascii.write(
+                H, format='fixed_width_two_line',
+                formats={'MMBasisS': "%.2f", 'valueE': "%.2f",
+                         'oBasisL': "%.2f", 'ltcGain': "%.2f", 'urevIncS': "%.2f", 'soldRegLoss': "%.2f",
+                         'soldRegGain': "%.2f", 'soldOtherLoss': "%.2f"})
 
-        snames = ('quantity', 'valueE', 'MMBasisS', 'soldRegGain', 'soldRegLoss', 'soldOtherLoss', 'ltcGain')
-        print("\nTotals:")
-        print("=======")
-        for x in snames:
-            s = np.sum(J2[x])
-            print(f"{x:15s}: {s:8.2f}")
+            snames = ('quantity', 'valueE', 'MMBasisS', 'soldRegGain',
+                      'soldRegLoss', 'soldOtherLoss', 'oBasisL', 'ltcGain')
+            print("\nTotals:")
+            print("=======")
+            for x in snames:
+                s = np.sum(J2[x])
+                print(f"{x:15s}: {s:8.0f}")
 
-        print("\n\n")
+            print("\n\n")
         # ==========
-
         J2 = J[np.logical_not(J['soldThisYear'])]
-        J2['dateS'] = Time(J2['dateS'], out_subfmt='date')
-        H = J2['dateS', 'quantity', 'valueE', 'MMBasisS', 'holdRegGain', 'urevIncS', 'holdRegLoss']
-        print("Holdings at the end of the tax year\n")
-        astropy.io.ascii.write(
-            H, format='fixed_width_two_line',
-            formats={'quantity': '%.2f', 'MMBasisS': "%.2f", 'valueE': "%.2f",
-                     'urevIncS': "%.2f", 'holdRegLoss': "%.2f",
-                     'holdRegGain': "%.2f"})
+        if len(J2) > 0:
+            J2['dateS'] = Time(J2['dateS'], out_subfmt='date')
+            H = J2['dateS', 'quantity', 'valueE', 'MMBasisS', 'holdRegGain', 'urevIncS', 'holdRegLoss']
+            H.sort(keys=['dateS'])
+            print("Holdings at the end of the tax year\n")
+            astropy.io.ascii.write(
+                H, format='fixed_width_two_line',
+                formats={'quantity': '%.2f', 'MMBasisS': "%.2f", 'valueE': "%.2f",
+                         'urevIncS': "%.2f", 'holdRegLoss': "%.2f",
+                         'holdRegGain': "%.2f"})
 
-        snames = ('quantity', 'valueE', 'MMBasisS', 'urevIncS', 'holdRegGain', 'holdRegLoss','holdRegInc')
-        print("\nTotals:")
-        print("=======")
-        for x in snames:
-            s = np.sum(J2[x])
-            print(f"{x:15s}: {s:8.2f}")
+            snames = ('quantity', 'valueE', 'MMBasisS', 'urevIncS',
+                      'holdRegGain', 'holdRegLoss', 'holdRegInc')
+            print("\nTotals:")
+            print("=======")
+            for x in snames:
+                s = np.sum(J2[x])
+                print(f"{x:15s}: {s:8.0f}")
