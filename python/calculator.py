@@ -487,7 +487,7 @@ class MMCalculator:
             H = J2['dateS', 'dateE', 'quantity', 'valueE', 'MMBasisS', 'soldRegGain', 'urevIncS',
                    'soldRegLoss', 'soldOtherLoss', 'oBasisL', 'ltcGain']
             H.sort(keys=['dateE'])
-            print("Sales during the tax year\n")
+            print(f"Sales during the tax year {tyear}\n")
             astropy.io.ascii.write(
                 H, format='fixed_width_two_line',
                 formats={'MMBasisS': "%.2f", 'valueE': "%.2f",
@@ -509,7 +509,7 @@ class MMCalculator:
             J2['dateS'] = Time(J2['dateS'], out_subfmt='date')
             H = J2['dateS', 'quantity', 'valueE', 'MMBasisS', 'holdRegGain', 'urevIncS', 'holdRegLoss']
             H.sort(keys=['dateS'])
-            print("Holdings at the end of the tax year\n")
+            print(f"Holdings at the end of the tax year {tyear}\n")
             astropy.io.ascii.write(
                 H, format='fixed_width_two_line',
                 formats={'quantity': '%.2f', 'MMBasisS': "%.2f", 'valueE': "%.2f",
