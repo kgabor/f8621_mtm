@@ -74,7 +74,7 @@ class MMCalculator:
         k_t : key for t in valueT for ``t``
         k_val : key for value in valueT
         """
-        if not np.all(valueT[k_t][1:] - valueT[k_t][:-1] >= 0):
+        if not np.all(valueT[k_t][1:] - valueT[k_t][:-1] >= 0.*units.day):
             raise ValueError("valueT is not monotonic increasing in dates")
         i = np.searchsorted(valueT[k_t], t)
         if i < len(valueT):
